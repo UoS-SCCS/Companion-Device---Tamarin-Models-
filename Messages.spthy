@@ -1,0 +1,1339 @@
+theory Messages
+/*
+This was run on hawk01.
+
+time tamarin-prover-161 Messages.spthy --heuristic=O --oraclename=oracle.py  --prove +RTS -N15 -RTS && date
+==============================================================================
+summary of summaries:
+
+analyzed: Messages.spthy
+
+  correctness_error_register_noWSS (exists-trace): verified (11 steps)
+  correctness_register_noWSS (exists-trace): verified (11 steps)
+  correctness_error_verify_noWSS (exists-trace): verified (14 steps)
+  correctness_verify_noWSS (exists-trace): verified (15 steps)
+  correctness_error_PUT_noWSS (exists-trace): verified (14 steps)
+  correctness_PUT_noWSS (exists-trace): verified (15 steps)
+  correctness_error_GET_noWSS (exists-trace): verified (14 steps)
+  correctness_GET_noWSS (exists-trace): verified (24 steps)
+  unique_session_key (all-traces): verified (24 steps)
+  no_replay_of_PC_request (all-traces): verified (24 steps)
+  no_replay_of_CD_response (all-traces): verified (24 steps)
+  register_AppID_once_only (all-traces): verified (2 steps)
+  two_PCs_can_use_AppID (exists-trace): verified (15 steps)
+  two_PCs_cannot_use_AppID (all-traces): verified (4 steps)
+  correctness_error_register (exists-trace): verified (19 steps)
+  correctness_register (exists-trace): verified (19 steps)
+  correctness_error_verify_slow (exists-trace): verified (38 steps)
+  correctness_verify_verySlow (exists-trace): verified (40 steps)
+
+==============================================================================
+
+real    65m0.433s
+user    313m34.720s
+sys     182m51.808s
+
+
+
+*/
+
+
+begin
+
+builtins: diffie-hellman, symmetric-encryption, signing
+
+functions:
+      PUT/1 //Wrapper for PUT request data - helps with PDs
+    , GET/1 //Wrapper for GET request data - helps with PDs
+
+//equality restriction
+restriction equality:
+    "All x y #i . Eq(x,y) @ i ==> (x = y)"
+
+// we only allow one asymmetric key pair per entity
+restriction OneASKeyPerEntity:
+    "All #i #j x. 
+        OnlyOneASKey(x)@#i & OnlyOneASKey(x)@#j 
+        ==> 
+        (#i = #j)
+    "
+    
+//only one Websocket server
+restriction OneWebSocketServer:
+    "All #i #j WSS. 
+        Entity('WebSocketServer', WSS) @ #i & Entity('WebSocketServer', WSS) @ #j 
+        ==> 
+        (#i = #j)
+    "
+
+//only one Push server
+restriction OneWebPushServer:
+    "All #i #j WPS. 
+        Entity('WebPushSever', WPS) @ #i & Entity('WebPushSever', WPS) @ #j 
+        ==> 
+        (#i = #j)
+    "
+
+//entities can only have one role
+restriction UniqueEntities:
+    "All #t01 #t02 type1 type2 entity . 
+        Entity(type1, entity) @ t01 & Entity(type2, entity) @ t02 
+        ==> 
+        ((type1 = type2) & (#t01 = #t02)) //only really need the second equality but this is clearer.
+    "
+//prevent the model from registering the same AppID twice
+restriction OneAppIDRegistrationOnly:
+    "All #t01 #t02 CD1 CD2 AppID PKappid1 PKappid2 . 
+        (CDRegistersAppID(CD1, AppID, PKappid1, 'Reg')@ t01 & CDRegistersAppID(CD2, AppID, PKappid2, 'Reg') @ t02)
+        ==> 
+        (#t01 = #t02) //only really need the second equality but this is clearer.
+    "
+
+/////////////////////////////////////
+// Public key infrastructure (PKI)
+////////////////////////////////////
+
+// Anyone can register at any time a public key together with its ID
+// But: only once per Entity
+rule Register_pk:
+    [ 
+        Fr(~skX) 
+    ]
+  
+    --[ 
+        OnlyOneASKey($X) 
+    ]->
+  
+    [
+        !Ltk($X, ~skX), 
+        !Pk($X, pk(~skX)),
+        Out(pk(~skX)) 
+    ] 
+//we use one  EC-DH and g is point generating the group of EC, ie EC=<g>
+rule DiffieHellmanGenerator:
+    let
+        gen='g'
+     in
+    []
+    
+    --[
+        DiffieHellmanG(gen)
+    ]->
+    
+    [
+        !DHgen(gen),
+        Out(gen)
+    ]
+    
+
+
+/////////////////////////////////////
+// Attacker
+//////////////
+
+// Compromising an entity's long-term key
+rule Reveal_sk:
+    [
+        !Ltk($X, skX)
+    ] 
+  
+    --[
+        //We identify the entity by its PK
+        Reveal(pk(skX),'sk', skX) 
+    ]-> 
+  
+    [
+        Out(skX)
+    ]
+
+// Leaking an entity's exponent 
+rule Reveal_exponent: 
+    [ 
+        !RevExp($X, exp1)
+        , !Pk($X, PKx)
+    ] 
+    --[
+        Reveal(PKx,'exponent',exp1)
+    ]-> 
+  
+    [ 
+        Out(exp1) 
+    ]
+
+//need a PC or host
+rule create_PC:
+    [ 
+        !Ltk($PC, ~sk_pc)
+    ]
+    
+    --[
+        Entity('PC', $PC),
+        CreatedPC($PC),
+        OnlyOnce('create_PC')
+        
+      ]->
+    [
+        !StatePC_Init($PC, ~sk_pc) 
+    ]
+
+//need a companion device
+rule create_CD:
+    [ 
+        !Ltk($CD, ~sk_cd),
+        Fr(~IDcd) // the unique CD identifier
+    ]
+    --[
+        Entity('Companion_Device', $CD),
+        CreatedCD($CD),
+        OnlyOnce('create_CD')
+    ]->
+    [
+          !StateCD_Init($CD, ~IDcd, ~sk_cd)
+        , WPSRegIDcd($CD, ~IDcd) //register the device with the Web Push Server
+    ]
+
+//need a WebSocket Server - there will only be one
+rule create_WSS:
+    []
+    
+    --[
+        Entity('WebSocketServer', $WSS),
+        CreatedWSS($WSS),
+        OnlyOnce('create_WSS')
+        
+    ]->
+    
+    []
+    
+//need a Web Push Server - there will only be one
+rule create_WPS:
+    []
+    
+    --[
+        Entity('WebPushSever', $WPS),
+        CreatedWPS($WPS),
+        OnlyOnce('create_WPS')
+        
+    ]->
+    
+    [
+        !WPSCreated($WPS)
+    ]
+    
+
+//the following rule will take care of enrolment & a run of the websocket connection of a companion device to a PC
+//Its output are last states from the websocketconnection run for the PC and CD respectively
+
+rule sessionKey_Established_CDPC:
+    let 
+        sessK=(g^~x)^~y
+    in
+    [
+          !StatePC_Init($PC, ~sk_pc)
+        , !Pk($PC, PKpc)
+        , !StateCD_Init($CD, ~IDcd, ~sk_cd)
+        , !Pk($CD, PKcd)
+        , Fr(~ADRpc) //ephemeral address for PC used by the WSS
+        , Fr(~ADRcd) //ephemeral address for CD used by the WSS
+        , Fr(~x) //PC exponent chosen during websocket connection
+        , Fr(~y) //CD exponent chosen during websocket connection
+        , !DHgen(g)
+    ]
+    
+    --[
+          SessionKeyEstPCCD($PC, $CD, PKpc, PKcd, ~IDcd, ~ADRpc, ~ADRcd, sessK)
+    ]->
+    
+    [
+          StatePC_SessionKeyEst($PC, ~sk_pc, PKpc, PKcd, ~IDcd, ~ADRcd, sessK) //the state at the end of the WebSocketConnection protocol
+        , StateCD_SessionKeyEst($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ~ADRpc, sessK) //the state at the end of the WebSocketConnection protocol
+        , !StateWSS_EntADRent($WSS, $PC, ~ADRpc) //associate the PC with ADRpc on the WSS to allow routing
+        , !StateWSS_EntADRent($WSS, $CD, ~ADRcd) //associate the CD with ADRcd on the WSS to allow routing      
+    ]
+
+//we model all messages - Tamarin will chose one at random
+rule reg_message_type:   
+    [
+          Fr(~AppID)
+    ]
+    --[
+        RandomMessageSelector()
+    ]->
+    [
+          Out(<'Reg', ~AppID>)
+        , Out(<'Verify', ~AppID>)
+        , Out(<'PUT',~AppID>) 
+        , Out(<'GET',~AppID>)
+    ]
+
+
+
+
+//registering the AppID
+rule PC_register_AppID:
+    let
+        details=<'SomeAppIDDescription',~AppDesc>
+        msg=<msgType, IDcd, AppID, details>
+        msg_signed=sign(msg,~sk_pc)
+        msg_enc=senc(<msg, msg_signed>, sessK)
+        msgOut=<ADRcd,msg_enc>
+    in
+    [
+          In(<msgType, AppID>)
+        , StatePC_SessionKeyEst($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK)
+        , Fr(~AppDesc)
+    ]
+    
+    --[
+          Eq(msgType,'Reg') //only allow Reg messages
+        , RegisterAppIDWithCD($PC, AppID, IDcd, msgType)
+        , OnlyOnce('PC_Register_AppID')
+        , PD_Out(msg_enc)
+    ]->
+    
+    [
+          Out(<$PC, $WSS, ADRcd,msg_enc>)
+        , StatePC_01($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, details)
+    ]
+
+//verification rule
+rule PC_verify_AppID:
+    let
+        details=<'desc', 'code', ~NoncePC>
+        msg=<msgType, IDcd, AppID, details>
+        msg_signed=sign(msg,~sk_pc)
+        msg_enc=senc(<msg, msg_signed>, sessK)
+        msgOut=<ADRcd,msg_enc>
+    in
+    [
+          In(<msgType, AppID>)
+        , !AppIDPK(AppID, PKappid)
+        , StatePC_SessionKeyEst($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK)
+        , Fr(~NoncePC)
+    ]
+    
+    --[
+          Eq(msgType,'Verify') //only allow Verify messages
+        , VerifyAppIDWithCD($PC, AppID, IDcd, msgType, ~NoncePC)
+        , OnlyOnce('PC_verify_AppID')
+        , PD_Out(msg_enc)
+    ]->
+    
+    [
+          Out(<$PC, $WSS, ADRcd,msg_enc>)
+        , StatePC_01($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, ~NoncePC)
+    ]
+    
+//PUT rule - structure identical to Verify rule -- TODO: refactor?
+rule PC_put_AppID:
+    let
+        details=<'desc', 'code', ~PUTdata>
+        msg=<msgType, IDcd, AppID, details>
+        msg_signed=sign(msg,~sk_pc)
+        msg_enc=senc(<msg, msg_signed>, sessK)
+        msgOut=<ADRcd,msg_enc>
+    in
+    [
+          In(<msgType, AppID>)
+        , !AppIDPK(AppID, PKappid)
+        , StatePC_SessionKeyEst($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK)
+        , Fr(~PUTdata)
+    ]
+    
+    --[
+          Eq(msgType,'PUT') //only allow PUT messages
+        , PUTAppIDEncryptCD($PC, AppID, IDcd, msgType, ~PUTdata)
+        , OnlyOnce('PC_put_AppID')
+        , PD_Out(msg_enc)
+        , PD_Out4(msg_enc)
+    ]->
+    
+    [
+          Out(<$PC, $WSS, ADRcd,msg_enc>)
+        , StatePC_01($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, ~PUTdata)
+    ]
+
+//GET rule 
+rule PC_GET_AppID:
+    let
+        //Note we use GET to wrap the encrypted data to get rid of Partial Deconstructions
+        details=<'desc', 'code', GET(EncryptedPUTData)>
+        msg=<msgType, IDcd, AppID, details>
+        msg_signed=sign(msg,~sk_pc)
+        msg_enc=senc(<msg, msg_signed>, sessK)
+        msgOut=<ADRcd,msg_enc>
+    in
+    [
+          In(<msgType, AppID>)
+        , !AppIDPK(AppID, PKappid)
+        //retrieve the previously encrypted data wrapped in PUT to avoid Partial Deconstructions
+        , !PCEncryptedPUT($PC, AppID, PUT(EncryptedPUTData)) 
+        , StatePC_SessionKeyEst($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK)
+    ]
+    
+    --[
+          Eq(msgType,'GET') //only allow GET messages
+        , GETAppIDDecryptCD($PC, AppID, IDcd, msgType, EncryptedPUTData)
+        , OnlyOnce('GET_put_AppID')
+        //, PD_Out(msg_enc)
+        , GETData_PD_In(msg_enc, EncryptedPUTData)
+    ]->
+    
+    [
+          Out(<$PC, $WSS, ADRcd,msg_enc>)
+        , StatePC_01($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, EncryptedPUTData)
+    ]
+
+
+
+
+// The WSS receives a message from X (PC or CD) and forwards it to Y (CD or PC)
+// Tamarin will not use this rule as the DY attacker has full access to the
+// content. This just shows that WSS is nothing but an untrusted router
+
+rule WSS_forwards_MSG_From_X_to_Y:
+    [
+        In(<$X, $WSS, ADRy, msg_enc>)
+        , !StateWSS_EntADRent($WSS, $ENTy, ADRy)
+    ]
+    
+    --[
+        ForwardFromXtoY($WSS, $X, $Y, msg_enc) // no OnlyOnce here as this rule gets executed multiple times
+    ]->
+    
+    [
+        Out(<$WSS, $ENTy, msg_enc>)
+    ]
+
+
+// On the companion device, we have the following conditions
+//  a) the user confirms the request
+//  b) the user rejects the request
+//  c) there was some other error condition, eg timeout, finger print did not match, etc
+//  we model a) as 'Confirms' and everything else as an 'ErrorCondition'
+//
+rule user_interaction:
+    []
+    
+    --[
+        RandomUserReaction()
+    ]->
+    
+    [
+        UserReaction('Confirms')
+        , UserReaction('ErrorCondition')
+    ]
+
+//this rules verifies the signature
+//note that we match the msgType from the PC and the CD
+rule CD_receives_PC_request_generic:
+    let
+        msg1=<msgType, ~IDcd, AppID, details> //details should be displayed to the user...
+        msgIn_enc=senc(<msg1, msg1_signed>, sessK) // we use pattern matching to decode
+    in
+    [
+          In(<$WSS, $CD, msgIn_enc>)
+        , UserReaction(reaction) //in response to the details being displayed
+        , StateCD_SessionKeyEst($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK)
+        //The following remove partial deconstructions
+        //https://tamarin-prover.github.io/manual/book/008_precomputation.html
+        , In(msgType) //deals with partial deconstructions - no need to have the msgTypes to be secret
+        , In(AppID) //deals with partial deconstructions - - no need for the AppID to be secret
+    ]
+    
+    --[
+        Eq(verify(msg1_signed,msg1, PKpc), true) //ensure the signature is valid
+        , CDVerifiesPCSig($CD, AppID, msgType)
+        //, AppID_PD_In(msgIn_enc, AppID)
+        //, MsgType_PD_In(msgIn_enc, msgType)
+        , NoReplayPCCD($CD, msgIn_enc) // this rule processes all PC request so is the best place to check uniqueness
+    ]->
+    
+    [
+        //pass the message on to the appropriate handler
+        StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, reaction)
+    ]
+
+
+
+// the companion device might respond with an error message if
+// a) the user rejects the request
+// b) some other error condition occurs
+// Note that this is in response to a valid request 
+// (ie it could be decrypted and the signature verified
+rule CD_receives_PCmsg_Generates_ErrorCondition:
+    let
+        msg=<msgType, AppID, 'ErrorConditionOccurred'>
+        msg_signed=sign(msg,~sk_cd)
+        msg_enc=senc(<msg, msg_signed>,sessK)
+    in
+    [
+          StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, 'ErrorCondition')
+    ]
+    
+    --[
+        CDGenerateErrorResponse($CD, AppID, msgType)
+        , OnlyOnce('CD_receives_PCmsg_Generates_ErrorCondition')
+    ]->
+    
+    [
+        Out(<$CD, $WSS, ADRpc, msg_enc>)
+    ]
+
+   
+// successful registration protocol execution
+// the CD generates a set of keys for the AppID
+rule CD_registers_AppID:
+    let
+        details=<'SomeAppIDDescription',AppDesc> //should be displayed to the user...
+        PKappid=pk(~AppID_sk)
+        msg=<msgType, AppID, PKappid>
+        msg_signed=sign(msg,~sk_cd)
+        msg_enc=senc(<msg, msg_signed>,sessK)
+    in
+    [
+        StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, 'Confirms')
+        , Fr(~AppID_AESKey) // a fresh AESKey for AppID
+        , Fr(~AppID_sk) // a fresh sk
+    ]
+    
+    --[
+        Eq(msgType,'Reg') //this is a registration message
+        , CDRegistersAppID($CD, AppID, PKappid, msgType)
+        , OnlyOnce('CD_registers_AppID')
+    ]->
+    
+    [
+          Out(<$CD, $WSS, ADRpc, msg_enc>)
+          //the companion device stores the AES Key and secret key and associates it with the public key of the PC that registered it.
+        , !CDAppID($CD, PKpc, AppID, ~AppID_AESKey, ~AppID_sk) 
+        , Out(pk(~AppID_sk)) // outing the public key as we cannot assume it remains secret
+    ]
+
+
+
+// successful verification protocol execution
+// the CD signs the supplied Nonce with AppID_sk
+rule CD_verify_AppID:
+    let
+        details=<'desc', 'code', NoncePC> //display desc+code to user
+        PKappid=pk(~AppID_sk)
+        msg=<msgType, AppID, sign(NoncePC,~AppID_sk)>
+        msg_signed=sign(msg,~sk_cd)
+        msg_enc=senc(<msg, msg_signed>,sessK)
+    in
+    [
+        StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, 'Confirms')
+        , !CDAppID($CD, PKpc1, AppID, ~AppID_AESKey, ~AppID_sk) //get the corresponding keys for this AppID
+
+    ]
+    
+    --[
+          Eq(msgType,'Verify') //this is a verification message
+        , Enforce('Verify', PKpc1, PKpc)  //this allows us to model an honest and dishonest CD
+        , CDVerifyAppID($CD, AppID, PKappid, msgType, NoncePC)
+        , OnlyOnce('CD_verify_AppID')
+    ]->
+    
+    [
+          Out(<$CD, $WSS, ADRpc, msg_enc>)
+    ]
+
+// successful PUT protocol execution
+// the CD encrypts the supplied PUTdata with AppID_aes
+rule CD_PUT_AppID:
+    let
+        details=<'desc', 'code', PUTdata> //display desc+code to user
+        //encrypt the data with the CD's secret AESKey
+        //Note we use PUT to wrap the encrypted data to get rid of Partial Deconstructions
+        msg=<msgType, AppID, PUT(senc(PUTdata, ~AppID_AESKey))> 
+        msg_signed=sign(msg,~sk_cd)
+        msg_enc=senc(<msg, msg_signed>,sessK)
+    in
+    [
+        StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, 'Confirms')
+        , !CDAppID($CD, PKpc1, AppID, ~AppID_AESKey, ~AppID_sk) //get the corresponding keys for this AppID
+
+    ]
+    
+    --[
+        Eq(msgType,'PUT') //this is a PUT message
+        , Enforce('PUT', PKpc1, PKpc)  //this allows us to model an honest and dishonest CD
+        , CDPUTAppID($CD, AppID, msgType, PUTdata)
+        , OnlyOnce('CD_PUT_AppID')
+    ]->
+    
+    [
+          Out(<$CD, $WSS, ADRpc, msg_enc>)
+          //protocol run finished on the companion
+    ]
+
+// successful GET protocol execution
+// the CD encrypts the supplied PUTdata with AppID_aes
+rule CD_GET_AppID:
+    let
+        PUTData=sdec(EncryptedPUTData,~AppID_AESKey)
+        details=<'desc', 'code', GET(EncryptedPUTData)> //display desc+code to user
+        msg1=<msgType, ~IDcd, AppID, 'desc', 'code', GET(EncryptedPUTData)>
+        msgIn_enc=senc(<msg1, msg1_signed>, sessK) // we use pattern-matching to decode
+        msg=<msgType, AppID, GET(PUTData)>
+        msg_signed=sign(msg,~sk_cd)
+        msg_enc=senc(<msg, msg_signed>,sessK)
+    in
+    [
+        StateCD_01($CD, ~IDcd, ~sk_cd, PKcd, PKpc, ADRpc, sessK, msgType, AppID, details, 'Confirms')
+        , !CDAppID($CD, PKpc1, AppID, ~AppID_AESKey, ~AppID_sk) //get the corresponding keys for this AppID
+
+    ]
+    
+    --[
+        Eq(msgType,'GET') //this is a GET message
+        , CDGETAppID($CD, AppID, msgType, EncryptedPUTData, PUTData)
+        , Enforce('GET', PKpc1, PKpc)  //this allows us to model an honest and dishonest CD
+        , OnlyOnce('CD_GET_AppID')
+    ]->
+    
+    [
+          Out(<$CD, $WSS, ADRpc, msg_enc>)
+          //protocol run finished on the companion
+    ]
+
+
+//this rules verifies the signature
+//note that we match the msgType from the PC and the CD
+rule PC_receives_CD_response_generic:
+    let     
+        msg1=<msgType, AppID, CDresponse>       // pattern matching on msgType and AppID
+        msgIn_enc=senc(<msg1, msg1_signed>, sessK) // we use pattern matching to decode
+    in
+    [
+          In(<$WSS, $PC, msgIn_enc>)
+        , StatePC_01($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, PCparams)
+    ]
+    
+    --[
+          Eq(verify(msg1_signed,msg1, PKcd), true) //ensure the signature is valid
+        , PCVerifiesCDSig($PC, AppID, msgType)
+        , UniqueSessKey(sessK) // this rule processes all CD responses so is the best place to check uniqueness
+        , NoReplayCDPC($PC, msgIn_enc)
+    ]->
+    
+    [
+        StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, PCparams, CDresponse)
+    ]
+
+//if we had an error condition, we will end up here
+rule PC_displays_ErrorMessage:
+    [
+        StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, PCparams, 'ErrorConditionOccurred')
+    ]
+    
+    --[
+          PCShowsError($PC, AppID, msgType)
+        , OnlyOnce('PC_displays_ErrorMessage')
+    ]->
+    
+    [
+        //Session key has now expired
+    ]
+
+rule PC_register_AppID_completed:
+    let
+        PKappid=pk(AppID_sk) //we are in the successful flow, ie this is not an error message
+    in
+    [
+        StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, PCparams, PKappid)
+    ]
+    
+    --[
+          Eq(msgType, 'Reg')
+        , PCRegisteredAppID($PC, IDcd, AppID, PKappid, msgType)
+        , OnlyOnce('PC_register_AppID_completed')
+    ]->
+    [
+        //the AppID and its PublicKey are now registered
+        //we can now use all the other messages
+        //note that we assume here that the AppID and PKappid1 are public knowledge
+        //after all the PC will need to store this and other apps
+        //might be able to read and thus use it.
+        !AppIDPK(AppID, PKappid) 
+        //the sessK has now expired and we need a new one
+    ]
+
+
+rule PC_verify_AppID_completed:
+    [
+          StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, NoncePC, SignedNoncePC)
+        , !AppIDPK(AppID, PKappid)
+    ]
+    
+    --[
+          Eq(msgType, 'Verify')
+        , Eq(verify(SignedNoncePC,NoncePC, PKappid), true) //ensure the signature is valid
+        , PCVerifiedAppID($PC, AppID, msgType, NoncePC)
+        , OnlyOnce('PC_verify_AppID_completed')
+    ]->
+    [
+        // successful verification
+        //the sessK has now expired and we need a new one
+    ]
+
+//Note that we cannot do any checks on this! Any garbage could be returned...
+
+rule PC_PUT_AppID_completed:
+    [
+          StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, PUTData, PUT(EncryptedPUTData))
+        , !AppIDPK(AppID, PKappid)
+    ]
+    
+    --[
+          Eq(msgType, 'PUT')
+        , PCPUTAppID($PC, AppID, msgType, PUTData, EncryptedPUTData)
+        , GETData_PD_Out(EncryptedPUTData)
+        , OnlyOnce('PC_PUT_AppID_completed')
+    ]->
+    [
+        // hopefully successful PUT!
+        //the sessK has now expired and we need a new one
+        !PCEncryptedPUT($PC,AppID, PUT(EncryptedPUTData)) //keep a copy of this for the GET request
+    ]
+
+
+//This rule just generates encrypted PUT facts for PCs to use. 
+//So a GET can be called without having to call PUT first
+rule Generate_EncryptedPUT_Facts:
+    [
+          In(AppID)
+        , Fr(~randomData)
+    ]
+    -->
+    [
+        !PCEncryptedPUT($PC,AppID, PUT(~randomData))
+    ]
+
+
+rule PC_GET_AppID_completed:
+    [
+          StatePC_02($PC, ~sk_pc, PKpc, PKcd, IDcd, ADRcd, sessK, msgType, AppID, EncryptedPUTData, GET(PUTData))
+        , !AppIDPK(AppID, PKappid)
+    ]
+    
+    --[
+          Eq(msgType, 'GET')
+        , PCGETAppID($PC, AppID, msgType, PUTData, EncryptedPUTData)
+        , OnlyOnce('PC_GET_AppID_completed')
+    ]->
+    [
+        //hopefully successful GET - note that the PC cannot usually check the result!
+    ]
+
+//END OF PROTOCOL
+
+//Verification starts here
+
+//demonstrate register with error path ignoreing WSS
+lemma correctness_error_register_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd ADRpc ADRcd sessK AppID msgType
+        #t01 #t02 #t03 
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t01
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t02
+        &
+        PCShowsError(PC, AppID, msgType) @ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//demonstrate successful register ignoreing WSS
+lemma correctness_register_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd ADRpc ADRcd sessK AppID msgType PKappid 
+        #t01 #t02 #t03
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t01
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t02
+        &
+        PCRegisteredAppID(PC, IDcd, AppID, PKappid, msgType) @ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//demonstrate a verify with error path ignoreing WSS
+lemma correctness_error_verify_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd AppID //creation & registration
+        ADRpc1 ADRcd2 sessK2 msgType2 NoncePC //verification-failure
+        #t01 #t02 #t03
+        .
+        //verify now starts we need a new Seessionkey
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t01
+        &
+        VerifyAppIDWithCD(PC, AppID, IDcd, msgType2, NoncePC) @ t02
+        &
+        PCShowsError(PC, AppID, msgType2) @ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//demonstrate a successful verify ignoreing WSS
+lemma correctness_verify_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd //creation
+        AppID ADRpc1 ADRcd2 sessK2 msgType2 NoncePC
+        #t01 #t02 #t03
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t01
+        &
+        VerifyAppIDWithCD(PC, AppID, IDcd, msgType2, NoncePC) @ t02
+        &
+        PCVerifiedAppID(PC, AppID, msgType2, NoncePC) @ t03
+        & 
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//demonstrate a PUT with error path ignoring WSS
+lemma correctness_error_PUT_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd //creation
+        AppID ADRpc1 ADRcd2 sessK2 msgType2 PUTData   //PUT-failure
+        #t01 #t02 #t03 
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t01
+        &
+        PUTAppIDEncryptCD(PC, AppID, IDcd, msgType2, PUTData) @ t02
+        &
+        PCShowsError(PC, AppID, msgType2)@ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//demonstrate a successful PUT ignoring WSS
+lemma correctness_PUT_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd //creation
+        AppID ADRpc1 ADRcd2 sessK2 msgType2 PUTData  EncryptedPUTData //PUT-success
+        #t01 #t02 #t03 
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t01
+        &
+        PUTAppIDEncryptCD(PC, AppID, IDcd, msgType2, PUTData) @ t02
+        &
+        PCPUTAppID(PC, AppID, msgType2, PUTData, EncryptedPUTData)@ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//demonstrate a GET with error path ignoring WSS
+lemma correctness_error_GET_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd //creation
+        AppID ADRpc1 ADRcd2 sessK2 msgType2 EncryptedPUTData   //GET-failure
+        #t01 #t02 #t03 
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t01
+        &
+        GETAppIDDecryptCD(PC, AppID, IDcd, msgType2, EncryptedPUTData) @ t02
+        &
+        PCShowsError(PC, AppID, msgType2)@ t03
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//demonstrate a successful GET ignoring WSS
+//note this lemma shows that we are getting back the original data
+//although a rogue CD could send back any odd rubbish and the PC would
+//not know unless it kept a copy of the original data defeating the point of
+//using PUT & GET
+lemma correctness_GET_noWSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd //creation
+        AppID ADRpc1 ADRcd1 sessK1 msgType1 PUTData  EncryptedPUTData //PUT-success
+        ADRpc2 ADRcd2 sessK2 msgType2 //GET-success 
+        #t01 #t02 #t03 #t04 #t05 #t06 
+        .
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd1, sessK1) @ t01
+        &
+        PUTAppIDEncryptCD(PC, AppID, IDcd, msgType1, PUTData) @ t02
+        &
+        PCPUTAppID(PC, AppID, msgType1, PUTData, EncryptedPUTData)@ t03
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc2, ADRcd2, sessK2) @ t04
+        &
+        GETAppIDDecryptCD(PC, AppID, IDcd, msgType2, EncryptedPUTData) @ t05
+        &
+        PCGETAppID(PC, AppID, msgType2, PUTData, EncryptedPUTData) @  t06
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//this shows that each message exchange uses a new session key
+lemma unique_session_key:
+"All sessK #t01 #t02 . 
+    (
+       // The UniqueSessKey attribute is present in the rule PC_receives_CD_response_generic
+       // which deals with every responses from the CD. The protocol design requires that
+       // each response should be received under a separate session key.
+       
+       //So whenever we have 2 instances of a sessK 
+        UniqueSessKey(sessK) @ t01 
+        &
+        UniqueSessKey(sessK) @ t02
+    )
+    ==>
+    ( //they must be the same time point, ie there are no two such instances
+        #t01=#t02
+    )
+"
+//we now show that an attacker cannot replay a previous message from the PC to the CD.
+//this is obvious from the above lemma but we prove it for completeness
+
+lemma no_replay_of_PC_request:
+"All CD msgIn_enc #t01 #t02 . 
+    (   //Whenever we have 2 instances of the same incoming encrypted message msg
+        NoReplayPCCD(CD, msgIn_enc) @ t01 
+        &
+        NoReplayPCCD(CD, msgIn_enc) @ t02
+    )
+    ==>
+    ( //they must be the same time point, ie there are no two such instances
+        #t01=#t02
+    )
+"
+
+//we now show that an attacker cannot replay a previous message from the CD.
+//this is obvious from the above lemma but we prove it for completeness
+lemma no_replay_of_CD_response:
+"All PC msgIn_enc #t01 #t02 . 
+    (   //Whenever we have 2 instances of the same incoming encrypted message msg
+        NoReplayCDPC(PC, msgIn_enc) @ t01 
+        &
+        NoReplayCDPC(PC, msgIn_enc) @ t02
+    )
+    ==>
+    ( //they must be the same time point, ie there are no two such instances
+        #t01=#t02
+    )
+"
+//this just verifies the global restriction we have
+lemma register_AppID_once_only:
+"All CD AppID PKappid1 PKappid2  #t01 #t02 . 
+    (   //Whenever we have 2 instances of the same AppID being registered
+        CDRegistersAppID(CD, AppID, PKappid1, 'Reg')@ t01 
+        &
+        CDRegistersAppID(CD, AppID, PKappid2, 'Reg')@ t02 
+    )
+    ==>
+    ( //they must be the same time point, ie there are no two such instances
+        #t01=#t02
+    )
+"
+
+//If the CD does not check PKpc of the PC making the request then
+//PC1 registers AppID with CD and PC2 can uses AppID to PUT a value (and GET/Verify...)
+lemma two_PCs_can_use_AppID: exists-trace
+    "Ex PC1 PC2 AppID IDcd PKappid 
+        PUTData EncryptedPUTData
+        #t01 #t02 #t03 
+        .
+        PCRegisteredAppID(PC1, IDcd, AppID, PKappid, 'Reg') @ t01
+        &
+        PUTAppIDEncryptCD(PC2, AppID, IDcd, 'PUT', PUTData) @ t02
+        &
+        PCPUTAppID(PC2, AppID, 'PUT', PUTData, EncryptedPUTData)@ t03
+        & 
+        not(PC1=PC2)
+    "
+//If the CD does enforce the check then this is not possible
+//PC1 registers AppID with CD but PC2 cannot uses AppID to PUT a value/
+lemma two_PCs_cannot_use_AppID:
+    "All PC1 PC2 AppID IDcd PKappid PUTData
+        #t01  #t02
+        .
+        PCRegisteredAppID(PC1, IDcd, AppID, PKappid, 'Reg') @ t01
+        &
+        PUTAppIDEncryptCD(PC2, AppID, IDcd, 'PUT', PUTData) @ t02
+        &
+        Enforce('PUT', PC2, PC2) @ t02
+        ==>
+           PC1=PC2
+    "
+
+
+//GETAppIDDecryptCD(PC, AppID, IDcd, msgType2, EncryptedPUTData) @ t05
+
+
+// The following correctness lemmas are slow to prove as they force Tamarin
+// to go through every rule in a prescribed order and include the unnecessary
+// WebSocket and WebPush server rules. 
+
+//Note this shows the websocket server rules even though they are not strictly needed.
+//proof takes 3 minutes on hawk01
+lemma correctness_error_register: exists-trace
+    "Ex PC CD WSS WPS PKpc PKcd IDcd ADRpc ADRcd sessK AppID msgType msg1_enc msg2_enc
+        #t01 #t02 #t03 #t04 #t05 #t06 #t07 #t08 #t09 
+        #t10 #t11 
+        .
+        CreatedPC(PC) @ t01 
+        &
+        CreatedCD(CD) @ t02
+        &
+        CreatedWSS(WSS) @ t03
+        &
+        CreatedWPS(WPS) @ t04
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t05
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t06
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg1_enc) @ t07
+        &
+        CDGenerateErrorResponse(CD, AppID, msgType) @ t08
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg2_enc) @ t09
+        &
+        PCVerifiesCDSig(PC, AppID, msgType) @ t10
+        &
+        PCShowsError(PC, AppID, msgType) @ t11 
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        #t06<#t07
+        &
+        #t07<#t08
+        &
+        #t08<#t09
+        &
+        #t09<#t10
+        &
+        #t10<#t11 
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//Note this shows the websocket server rules even though they are not strictly needed.
+//Registration flow
+//proof takes 1.5 minutes on hawk01
+lemma correctness_register: exists-trace
+    "Ex PC CD WSS WPS PKpc PKcd IDcd ADRpc ADRcd sessK AppID msgType msg1_enc PKappid msg2_enc
+        #t01 #t02 #t03 #t04 #t05 #t06 #t07 #t08 #t09 
+        #t10 #t11 
+        .
+        CreatedPC(PC) @ t01 
+        &
+        CreatedCD(CD) @ t02
+        &
+        CreatedWSS(WSS) @ t03
+        &
+        CreatedWPS(WPS) @ t04
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t05
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t06
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg1_enc) @ t07
+        &
+        CDRegistersAppID(CD, AppID, PKappid, msgType)@ t08
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg2_enc) @ t09
+        &
+        PCVerifiesCDSig(PC, AppID, msgType) @ t10
+        &
+        PCRegisteredAppID(PC, IDcd, AppID, PKappid, msgType) @ t11
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        #t06<#t07
+        &
+        #t07<#t08
+        &
+        #t08<#t09
+        &
+        #t09<#t10
+        &
+        #t10<#t11
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//We need a successful registration before a verify error
+//proof takes 15+ minutes on hawk01
+lemma correctness_error_verify_slow: exists-trace
+    "Ex PC CD WSS WPS PKpc PKcd IDcd //creation
+        ADRpc ADRcd sessK AppID msgType msg1_enc PKappid msg2_enc //registration
+        ADRpc1 ADRcd2 sessK2 msgType2 msg3_enc NoncePC msg4_enc  //verification-failure
+        #t01 #t02 #t03 #t04 #t05 #t06 #t07 #t08 #t09 #t10 #t11
+        #t12 #t13 #t14 #t15 #t16 #t17 #t18
+        .
+        CreatedPC(PC) @ t01 
+        &
+        CreatedCD(CD) @ t02
+        &
+        CreatedWSS(WSS) @ t03
+        &
+        CreatedWPS(WPS) @ t04
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t05
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t06
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg1_enc) @ t07
+        &
+        CDRegistersAppID(CD, AppID, PKappid, msgType)@ t08
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg2_enc) @ t09
+        &
+        PCVerifiesCDSig(PC, AppID, msgType) @ t10
+        &
+        PCRegisteredAppID(PC, IDcd, AppID, PKappid, msgType) @ t11
+        //verify now starts we need a new Seessionkey
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t12
+        &
+        VerifyAppIDWithCD(PC, AppID, IDcd, msgType2, NoncePC) @ t13
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg3_enc) @ t14
+        &
+        CDGenerateErrorResponse(CD, AppID, msgType2) @ t15
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg4_enc) @ t16
+        &
+        PCVerifiesCDSig(PC, AppID, msgType2) @ t17
+        &
+        PCShowsError(PC, AppID, msgType2) @ t18 
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        #t06<#t07
+        &
+        #t07<#t08
+        &
+        #t08<#t09
+        &
+        #t09<#t10
+        &
+        #t10<#t11
+        &
+        #t11<#t12
+        &
+        #t12<#t13
+        &
+        #t13<#t14
+        &
+        #t14<#t15
+        &
+        #t15<#t16
+        &
+        #t17<#t18
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//We need a successful registration before a successful verify
+//proof takes 90+ minutes on hawk01
+lemma correctness_verify_verySlow: exists-trace
+    "Ex PC CD WSS WPS PKpc PKcd IDcd //creation
+        ADRpc ADRcd sessK AppID msgType msg1_enc PKappid msg2_enc //registration
+        ADRpc1 ADRcd2 sessK2 msgType2 msg3_enc NoncePC msg4_enc  //verification-failure
+        #t01 #t02 #t03 #t04 #t05 #t06 #t07 #t08 #t09 #t10 #t11
+        #t12 #t13 #t14 #t15 #t16 #t17 #t18
+        .
+        CreatedPC(PC) @ t01 
+        &
+        CreatedCD(CD) @ t02
+        &
+        CreatedWSS(WSS) @ t03
+        &
+        CreatedWPS(WPS) @ t04
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc, ADRcd, sessK) @ t05
+        &
+        RegisterAppIDWithCD(PC, AppID, IDcd, msgType) @ t06
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg1_enc) @ t07
+        &
+        CDRegistersAppID(CD, AppID, PKappid, msgType)@ t08
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg2_enc) @ t09
+        &
+        PCVerifiesCDSig(PC, AppID, msgType) @ t10
+        &
+        PCRegisteredAppID(PC, IDcd, AppID, PKappid, msgType) @ t11
+        //verify now starts we need a new Seessionkey
+        &
+        SessionKeyEstPCCD(PC, CD, PKpc, PKcd, IDcd, ADRpc1, ADRcd2, sessK2) @ t12
+        &
+        VerifyAppIDWithCD(PC, AppID, IDcd, msgType2, NoncePC) @ t13
+        &
+        ForwardFromXtoY(WSS, PC, CD, msg3_enc) @ t14
+        &
+        CDVerifyAppID(CD, AppID, PKappid, msgType2, NoncePC) @ t15
+        &
+        ForwardFromXtoY(WSS, CD, PC, msg4_enc) @ t16
+        &
+        PCVerifiesCDSig(PC, AppID, msgType2) @ t17
+        &
+        PCVerifiedAppID(PC, AppID, msgType2, NoncePC) @ t18 
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        #t06<#t07
+        &
+        #t07<#t08
+        &
+        #t08<#t09
+        &
+        #t09<#t10
+        &
+        #t10<#t11
+        &
+        #t11<#t12
+        &
+        #t12<#t13
+        &
+        #t13<#t14
+        &
+        #t14<#t15
+        &
+        #t15<#t16
+        &
+        #t17<#t18
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+//*************NOT NEEDED ANYMORE******************//
+// source lemmas to remove partial deconstructions caused by the AppID and msgType variables
+// note that these lemmas remove the partial deconstructions
+// but their proof gets stuck in an infinite loop and they run out of memory
+// these have now been replaced by the use of In(msgType) and In(AppID) in 
+// rule CD_receives_PC_request_generic:
+/*
+lemma appID_PD [sources]:
+"All msg_enc_sign AppID #t02 .
+        AppID_PD_In(msg_enc_sign, AppID) @ t02
+        ==>
+        (Ex #t01 . KU (AppID) @ t01 & #t01<#t02)
+        |
+        (Ex  #t01 . PD_Out(msg_enc_sign) @ t01 & #t01<#t02)
+"
+
+lemma msgType_PD [sources]:
+"All msg_enc_sign msgType #t02 .
+        MsgType_PD_In(msg_enc_sign, msgType) @ t02
+        ==>
+        (Ex #t01 . KU (msgType) @ t01 & #t01<#t02)
+        |
+        (Ex  #t01 . PD_Out(msg_enc_sign) @ t01 & #t01<#t02)
+"
+*/
+
+
+
+end
