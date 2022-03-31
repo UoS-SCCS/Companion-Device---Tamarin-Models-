@@ -1,0 +1,572 @@
+theory Enrolment
+/*
+
+time tamarin-prover-161 Enrolment.spthy  --prove +RTS -N15 -RTS && date
+==============================================================================
+summary of summaries:
+
+analyzed: Enrolment.spthy
+
+  correctness (exists-trace): verified (22 steps)
+  correctness_without_WSS (exists-trace): verified (7 steps)
+  injective_agreement_sessK (all-traces): verified (28 steps)
+  sessK_isSecret (all-traces): verified (24 steps)
+  Two_CDs_Enrolled_With_Same_PC (exists-trace): verified (15 steps)
+  CD_Enrolled_With_Two_PCs (exists-trace): verified (15 steps)
+
+==============================================================================
+
+real    0m2.928s
+user    0m23.392s
+sys     0m6.260s
+Mon 28 Feb 14:56:31 GMT 2022
+
+
+*/
+
+
+begin
+
+builtins: diffie-hellman, symmetric-encryption, signing
+
+//used to prevent partial deconstructions...not needed atm
+//functions: ADR/1
+
+//equality restriction
+restriction equality:
+    "All x y #i . Eq(x,y) @ i ==> (x = y)"
+
+// we only allow one asymmetric key pair per entity
+restriction OneASKeyPerEntity:
+    "All #i #j x. 
+        OnlyOneASKey(x)@#i & OnlyOneASKey(x)@#j 
+        ==> 
+        (#i = #j)
+    "
+    
+//only one Websocket server
+restriction OneWebSocketServer:
+    "All #i #j WSS. 
+        Entity('WebSocketServer', WSS) @ #i & Entity('WebSocketServer', WSS) @ #j 
+        ==> 
+        (#i = #j)
+    "
+
+//only one Push server
+restriction OneWebPushServer:
+    "All #i #j WPS. 
+        Entity('WebPushSever', WPS) @ #i & Entity('WebPushSever', WPS) @ #j 
+        ==> 
+        (#i = #j)
+    "
+
+//entities can only have one role
+restriction UniqueEntities:
+    "All #t01 #t02 type1 type2 entity . 
+        Entity(type1, entity) @ t01 & Entity(type2, entity) @ t02 
+        ==> 
+        ((type1 = type2) & (#t01 = #t02)) //only really need the second equality but this is clearer.
+    "
+
+/////////////////////////////////////
+// Public key infrastructure (PKI)
+////////////////////////////////////
+
+// Anyone can register at any time a public key together with its ID
+// But: only once per Entity
+rule Register_pk:
+    [ 
+        Fr(~skX) 
+    ]
+  
+    --[ 
+        OnlyOneASKey($X) 
+    ]->
+  
+    [
+        !Ltk($X, ~skX), 
+        !Pk($X, pk(~skX)),
+        Out(pk(~skX)) 
+    ] 
+//we use one  EC-DH and g is point generating the group of EC, ie EC=<g>
+rule DiffieHellmanGenerator:
+    let
+        gen='g'
+     in
+    []
+    
+    --[
+        DiffieHellmanG(gen)
+    ]->
+    
+    [
+        !DHgen(gen),
+        Out(gen)
+    ]
+    
+
+
+/////////////////////////////////////
+// Attacker
+//////////////
+
+// Compromising an entity's long-term key
+rule Reveal_sk:
+    [
+        !Ltk($X, skX)
+    ] 
+  
+    --[
+        //We identify the entity by its PK
+        Reveal(pk(skX),'sk', skX) 
+    ]-> 
+  
+    [
+        Out(skX)
+    ]
+
+// Leaking an entity's exponent 
+rule Reveal_exponent: 
+    [ 
+        !RevExp($X, exp1)
+        , !Pk($X, PKx)
+    ] 
+    --[
+        Reveal(PKx,'exponent',exp1)
+    ]-> 
+  
+    [ 
+        Out(exp1) 
+    ]
+
+//need a PC or host
+rule create_PC:
+    [ 
+        !Ltk($PC, ~sk_pc),
+        !DHgen(g)
+    ]
+    
+    --[
+        Entity('PC', $PC),
+        CreatedPC($PC),
+        OnlyOnce('create_PC')
+        
+      ]->
+    [
+        !StatePC_01($PC, ~sk_pc, g) // g is the agreed base mod p for DH
+    ]
+
+//need a companion device
+rule create_CD:
+    [ 
+        !Ltk($CD, ~sk_cd),
+        !DHgen(g),
+        Fr(~IDcd) // the unique CD identifier
+    ]
+    --[
+        Entity('Companion_Device', $CD),
+        CreatedCD($CD),
+        OnlyOnce('create_CD')
+    ]->
+    [
+        !StateCD_01($CD, ~IDcd, ~sk_cd, g) // g is the agreed base mod p for DH
+    ]
+
+//need a WebSocket Server - there will only be one
+rule create_WSS:
+    []
+    
+    --[
+        Entity('WebSocketServer', $WSS),
+        CreatedWSS($WSS),
+        OnlyOnce('create_WSS')
+        
+    ]->
+    
+    []
+    
+//need a Web Push Server - there will only be one
+rule create_WPS:
+    []
+    
+    --[
+        Entity('WebPushSever', $WPS),
+        CreatedWPS($WPS),
+        OnlyOnce('create_WPS')
+        
+    ]->
+    
+    []
+
+//MSG1: PC initiates a connection to the WebSocket Server
+
+rule PC_init:
+    [
+        Fr(~x), // the power to calculate g^x
+        !StatePC_01($PC, ~sk_pc, g)
+    ]
+    
+    --[
+        SendInit($PC, $WSS),
+        OnlyOnce('PC_init')
+    ]->
+    
+    [
+        Out(<$PC, $WSS, 'INIT'>) //unsecure channel between PC and WSS - in reality it will be TLS secured but WSS is untrusted
+        , StatePC_02($PC, ~sk_pc, g, ~x)
+        , !RevExp($PC, ~x)  // allow the PC to leak the exponent key
+    ]
+
+//MSG2 & MSG5: Web socket server generates an ephemeral AddressID for the entity X
+
+rule WSS_responds_to_init_from_X:
+    [
+        In(<$X, $WSS, 'INIT'>)
+        , Fr(~ADRent)
+    ]
+    
+    --[
+        CreateSendADRent($WSS, $X,~ADRent) // no OnlyOnce here as this rule gets executed multiple times
+    ]->
+    
+    [
+        Out(<$PC, $WSS, ~ADRent>)
+        , StateWSS_01($WSS, $X, ~ADRent)
+    ]
+
+//MSG3: The PC now creates a QRCode for the companion device to scan
+//TODO: Do we need to assume that this message cannot be tampered with???
+//It can certainly be read by multiple companion devices
+
+
+rule PC_showQRcode:
+    let 
+        gx=g^~x
+        msg=<ADRpc, pk(~sk_pc), gx>
+        signature=sign(msg,~sk_pc)
+    in
+    [
+        In(<$PC, $WSS, ADRpc>),
+        !Pk($PC, pk(~sk_pc)),
+        StatePC_02($PC, ~sk_pc, g, ~x)
+    ]
+    
+    --[
+        ShowQRCode($PC, ADRpc, gx, pk(~sk_pc)),
+        OnlyOnce('PC_showQRcode')
+    ]->
+    
+    [
+       StatePC_03($PC, ~sk_pc, pk(~sk_pc), ~x, gx),
+       !QRCodeMsg(msg, signature)  // this models that more than one device can read it
+       //, Out(<msg, signature>)        // this gives an attacker full access if needed
+    ]
+
+//MSG4: At least one Companion Device reads the QR code and sends an INIT to the WebSocketServer
+//Note it is important that the PC app does not accept multiple responses to this QRCode
+//We model this by using non-persistent state facts which can only be consumed once!
+
+rule CD_readsQRCode:
+    let
+        msg=<ADRpc, PKpc, gx>
+        sessK=gx^~y //matches k in the diagram
+    in
+    [
+        Fr(~y),
+        !QRCodeMsg(msg, signature),
+        !StateCD_01($CD, ~IDcd, ~sk_cd, g)
+    ]
+    --[
+        Eq(verify(signature,msg, PKpc), true), //ensure the signature is valid
+        CDReadQR($CD, ADRpc, gx, sessK, PKpc),
+        OnlyOnce('CD_readsQRCode')
+    ]->
+    
+    [
+        Out(<$CD, $WSS, 'INIT'>),
+        StateCD_02($CD, ~IDcd, ~sk_cd, g, ~y, gx, sessK, ADRpc, PKpc)
+        , !RevExp($CD, ~y)  // allow the companion device to leak its exponent key
+    ]
+        
+// MSG 5: The WebSocketServer responds with an address 
+// This is the same message as message MSG2 and is handled 
+// by the rule  WSS_responds_to_init_from_X
+
+// MSG 6: The companion device receives its ADRcd and sends its session key contribution 
+// to the WSS to forward to the PC
+
+rule CD_Sends_GY:
+    let
+        gy=g^~y //the session key contribution from the companion device
+        msg1=<gx, gy, ADRcd, ~IDcd, pk(~sk_cd)>
+        signmsg1=sign(msg1,~sk_cd)
+        msg2=<ADRcd, ~IDcd, pk(~sk_cd), signmsg1>        
+        msg_enc=senc(msg2,sessK)
+    in
+    [
+        In(<$CD, $WSS, ADRcd>), // the response from the WSS (see MSG 2)
+        StateCD_02($CD, ~IDcd, ~sk_cd, g, ~y, gx, sessK, ADRpc, PKpc),
+        !Pk($CD, pk(~sk_cd)) 
+    ]
+    --[
+        CDSendsGY($CD, ADRcd, ADRpc, gy, gx, sessK, pk(~sk_cd), ~IDcd),
+        OnlyOnce('CD_Sends_GY')
+    ]->
+    
+    [
+        Out(<$CD, $WSS, ADRpc, gy, msg_enc>),
+        StateCD_03($CD, ~IDcd, ~sk_cd, pk(~sk_cd), gy, gx, sessK, ADRpc, PKpc)
+    ]
+
+//MSG 7: The WebSocketServer receives the message and simply passes it on to the PC which corresponds
+// to ADRpc
+
+rule WSS_forwards_CDmsg_to_PC:
+    [
+        In(<$CD, $WSS, ADRpc, gy, msg_enc>),
+        StateWSS_01($WSS, $PC, ADRpc)
+        //Note that this is non-persistent so it will only accept one such request
+        //if multiple device scan the QR code only _one_ of the responses will be accepted
+        //need to make sure this is clearly shown in the UI of the PC app and companion apps
+        //to avoid someone else registering (shoulder surfing and scanning the QR code before
+        //the legitimate user had a chance to scan it)
+    ]
+    
+    --[
+        WSSForwardsToPC($WSS, $CD, $PC, ADRpc, gy),
+        OnlyOnce('WSS_forwards_CDmsg_to_PC')
+    ]->
+    
+    [
+       Out(<$WSS, $PC, gy, msg_enc>)
+    ]
+        
+//MSG 8: The PC receives the message and verifies the signature and responds to confirm the 
+// correct receipt of the public key by signing the sessK components.
+//This completes the enrolment process for the PC
+
+rule PC_receives_CDmsg_completes_enrolement:
+    let 
+        sessK=gy^~x
+        //use pattern matching to decode...
+        msg_enc=senc(<ADRcd, IDcd, PKcd, signMsg1>, sessK)        
+        verify_msg=<gx, gy, ADRcd, IDcd, PKcd>
+        msgout_enc=senc(sign(<gx, gy>,~sk_pc), sessK)
+    in
+    [
+        In(<$WSS, $PC, gy, msg_enc>),
+        In(ADRcd), //partial deconstructions
+        StatePC_03($PC, ~sk_pc, PKpc, ~x, gx)
+    ]
+    
+    --[
+        Eq(verify(signMsg1, verify_msg, PKcd), true),
+        PCcompletesEnrolment($PC, PKpc, PKcd, IDcd, sessK),
+        OnlyOnce('PC_receives_CDmsg_completes_enrolement'),
+        Running($PC, PKpc, PKcd, IDcd, sessK),
+        Secret(PKpc, PKcd, sessK),
+        Honest(PKcd),
+        Honest(PKpc),
+        Honest($PC)
+    ]->
+    
+    [
+        Out(<$PC, $WSS, ADRcd, msgout_enc>)
+        //End of enrolment for the PC -the following state will be used in subsequent parts of the protocol
+        //It's a persistent fact so that it can be re-used as a starting point
+        , !StatePC_Enrolled($PC, ~sk_pc, PKpc, PKcd, IDcd) 
+    ]
+    
+//MSG 9: WebSocketServer receives PC message and forwards it to the companion device
+
+rule WSS_forward_PCmsg_to_CD:
+    [
+        In(<$PC, $WSS, ADRcd, msg_enc>),
+        StateWSS_01($WSS, $CD, ADRcd)
+    ]
+    
+    --[
+        WSSForwardsToCD($WSS, $PC, $CD, ADRcd, msg_enc),
+        OnlyOnce('WSS_forward_PCmsg_to_CD')
+    ]->
+    
+    [
+        Out(<$WSS, $CD, msg_enc>)
+    ]
+
+// Enrolment finished: Companion_Device obtains message and verifies it.
+
+rule CD_receives_PCmsg_verifies_sig:
+    let
+        msg_enc=senc(signMsg, sessK)
+        verify_msg=<gx,gy>
+    in
+    [
+        In(<$WSS, $CD, msg_enc>),
+        StateCD_03($CD, ~IDcd, ~sk_cd, PKcd, gy, gx, sessK, ADRpc, PKpc)
+    ]
+    
+    --[
+        Eq(verify(signMsg,verify_msg,PKpc),true),
+        CDcompletesEnrolment($CD, PKpc, PKcd, ~IDcd, sessK),
+        Commit($CD, PKpc, PKcd, ~IDcd, sessK),
+        Secret(PKcd, PKpc, sessK),
+        Honest(PKcd),
+        Honest(PKpc),
+        Honest($CD),
+        OnlyOnce('CD_receives_PCmsg_verifies_sig')
+    ]->
+    
+    [
+    //end of enrolment for CD -this state will be used in subsequent parts of the protocol
+    //It's a persistent fact so that it can be re-used as a starting point
+    !StateCD_Enrolled($CD, ~IDcd, ~sk_cd, PKcd, PKpc) 
+    ]
+
+
+//Verification starts here
+//Note this shows the websocket server rules even though they are not strictly needed.
+lemma correctness: exists-trace
+    "Ex PC CD WSS WPS ADRpc gx PKpc sessK ADRcd gy PKcd IDcd msg_enc
+        #t01 #t02 #t03 #t04 #t05 #t06 #t07 
+        #t08 #t09 #t10 #t11 #t12 #t13 #t14
+        .
+        CreatedPC(PC) @ t01 
+        &
+        CreatedCD(CD) @ t02
+        &
+        CreatedWSS(WSS) @ t03
+        &
+        CreatedWPS(WPS) @ t04
+        &
+        SendInit(PC, WSS) @ t05
+        &
+        CreateSendADRent(WSS, PC,ADRpc) @ t06
+        &
+        ShowQRCode(PC, ADRpc, gx, PKpc) @ t07
+        &
+        CDReadQR(CD, ADRpc, gx, sessK, PKpc) @ t08
+        &
+        CreateSendADRent(WSS, CD,ADRcd) @ t09
+        &
+        CDSendsGY(CD, ADRcd, ADRpc, gy, gx, sessK, PKcd, IDcd) @ t10
+        &
+        WSSForwardsToPC(WSS, CD, PC, ADRpc, gy) @ t11
+        &
+        PCcompletesEnrolment(PC, PKpc, PKcd, IDcd, sessK) @ t12
+        &
+        WSSForwardsToCD(WSS, PC, CD, ADRcd, msg_enc) @ t13
+        &
+        CDcompletesEnrolment(CD, PKpc, PKcd, IDcd, sessK) @ t14
+        &
+        #t01<#t02
+        &
+        #t02<#t03
+        &
+        #t03<#t04
+        &
+        #t04<#t05
+        &
+        #t05<#t06
+        &
+        #t06<#t07
+        &
+        #t07<#t08
+        &
+        #t08<#t09
+        &
+        #t09<#t10
+        &
+        #t10<#t11
+        &
+        #t11<#t12
+        &
+        #t12<#t13
+        &
+        #t13<#t14
+        &
+        //we only execute each rule once
+        (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+        &
+        //we didn't have a key reveal
+        (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+
+//this lemma shows that the DY attacker can just intercepts any message and
+//bypass the websocket server
+
+lemma correctness_without_WSS: exists-trace
+    "Ex PC CD PKpc PKcd IDcd sessK #t01 #t02
+    .
+    PCcompletesEnrolment(PC, PKpc, PKcd, IDcd, sessK) @ t01
+    &
+    CDcompletesEnrolment(CD, PKpc, PKcd, IDcd, sessK) @ t02
+    &
+    #t01<#t02
+    &
+    //we only execute each rule once
+     (All event #x #y . OnlyOnce(event) @ x & OnlyOnce(event) @ y ==> #x=#y)
+    &
+    //we didn't have a key reveal
+    (not (Ex entity type key #k . Reveal(entity, type, key) @ k))
+    "
+    
+lemma injective_agreement_sessK:
+    "All CD PKpc PKcd IDcd sessK #t02 
+    .
+        Commit(CD, PKpc, PKcd, IDcd, sessK) @ t02
+        ==>
+        (Ex PC #t01 .Running(PC, PKpc, PKcd, IDcd, sessK) @ t01 & #t01<#t02
+        &
+        not (Ex CD2 PKpc2 PKcd2 IDcd2 #t03. Commit(CD2, PKpc2, PKcd2, IDcd2, sessK) @t03
+             & not (#t03 = #t02))
+        )
+        |
+        (Ex C type key #r . Reveal(C, type, key) @ r & Honest(C) @ t02)
+    "
+
+lemma sessK_isSecret:
+    "All PKent1 PKent2 sessK #t01
+    .
+        Secret(PKent1, PKent2, sessK) @ t01
+        ==>
+        (not (Ex #t02 . K(sessK) @ t02))
+        |
+        (Ex PK type key #r . Reveal(PK, type, key) @ r & Honest(PK) @ t01)
+    "
+    
+//some more sanity checks
+
+//A PC can have more than one CD enrolled:
+lemma Two_CDs_Enrolled_With_Same_PC:exists-trace
+    "Ex PC PKpc CD1 PKcd1 IDcd1 sessK1 CD2 PKcd2 IDcd2 sessK2 #t01 #t02 #t03 #t04
+    .
+    PCcompletesEnrolment(PC, PKpc, PKcd1, IDcd1, sessK1) @ t01
+    &
+    CDcompletesEnrolment(CD1, PKpc, PKcd1, IDcd1,sessK1) @ t02
+    &
+    PCcompletesEnrolment(PC, PKpc, PKcd2, IDcd2, sessK2) @ t03
+    &
+    CDcompletesEnrolment(CD2, PKpc, PKcd2, IDcd2, sessK2) @ t04
+    &
+    not(CD1 = CD2) 
+    &
+    not (#t01=#t03)
+    "
+//A CD can have be enrolled with more than one PC:
+lemma CD_Enrolled_With_Two_PCs:exists-trace
+    "Ex PC1 PKpc1 PC2 PKpc2 CD PKcd IDcd sessK1 sessK2 #t01 #t02 #t03 #t04
+    .
+    PCcompletesEnrolment(PC1, PKpc1, PKcd, IDcd, sessK1) @ t01
+    &
+    CDcompletesEnrolment(CD, PKpc1, PKcd, IDcd, sessK1) @ t02
+    &
+    PCcompletesEnrolment(PC2, PKpc2, PKcd, IDcd, sessK2) @ t03
+    &
+    CDcompletesEnrolment(CD, PKpc2, PKcd, IDcd, sessK2) @ t04
+    &
+    not(PC1 = PC2) 
+    &
+    not (#t02 = #t04)
+    "
+end
